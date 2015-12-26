@@ -22,10 +22,10 @@ class BasicLayer(layers.Layer):
 
         # the weight and the nonlinearity is set locally
         self.input2hidden_layer = layers.DenseLayer(incoming, num_units_hidden,
-                                                    nonlinearity = nonlinearities.softplus)
+                                                    nonlinearity = T.nnet.softplus)
 
         self.hidden2output_layer = layers.DenseLayer(self.input2hidden_layer, num_units_output,
-                                                     nonlinearity = nonlinearities.softplus)
+                                                     nonlinearity = T.nnet.softplus)
 
 
     def get_output_for(self, input):
@@ -34,9 +34,8 @@ class BasicLayer(layers.Layer):
         return output_activation
 
 
-    @property
-    def get_output_shape_for(self, input):
-        return [self.input_shape[0], self.num_units_output]
+    def get_output_shape_for(self, input_shape):
+        return [input_shape[0], self.num_units_output]
 
 
     def get_params(self):
@@ -50,22 +49,22 @@ class SamplerLayer(layers.MergeLayer):
     def __init__(self, incomings):
         super(SamplerLayer, self).__init__(incomings)
         self.mrg_srng = MRG_RandomStreams()
-        self.incomings = incomings
-        self.dim_sampling = self.input_shape[0].output_shape[1]
-        print('dim_sampling: ' + self.dim_sampling)
+        self.dim_sampling = self.input_shapes[0][1]
+        print('dim_sampling: ', self.dim_sampling)
         return
 
 
     def get_output_for(self, inputs):
-        assert isinstance(input, list)
-        eps = self.mrg_srng.normal(self.dim_sampling)
-        return inputs[0] + eps * inputs[1]
+        assert isinstance(inputs, list)
+        eps = self.mrg_srng.normal((self.dim_sampling,))
+        return inputs[0] + inputs[1] * eps
 
 
-    @property
-    def get_output_shape_for(self, input_shape):
-        print('samplerlayer shape: ' + self.input_shape[0].output_shape)
-        return self.input_shape[0].output_shape
+    def get_output_shape_for(self, input_shapes):
+        print('samplerlayer shape: ', input_shapes[0])
+        assert input_shapes[0] == input_shapes[1]
+        return input_shapes[0]
+
 
     def get_params(self):
         return []
@@ -97,6 +96,7 @@ class SemiVAE(layers.MergeLayer):
         self.num_classes = incomings[1].output_shape[1]
         self.num_units_hidden_common = num_units_hidden_common
         self.dim_z = dim_z
+        self.alpha = alpha
 
         self.concat_xy  = layers.ConcatLayer(self.incomings, axis=1)
         self.encoder_mu = BasicLayer(self.concat_xy,
@@ -114,9 +114,9 @@ class SemiVAE(layers.MergeLayer):
         print('dim_image: ', dim_image)
 
         # merge encoder_mu and encoder_sigma to get z.
-        self.sampler = SamplerLayer([self.encoder_mu, self.encoder_sigma])
+        self.sampler = SamplerLayer((self.encoder_mu, self.encoder_sigma))
 
-        self.concat_yz = layers.ConcatLayer([label_input, self.sampler], axis=1),
+        self.concat_yz = layers.ConcatLayer([label_input, self.sampler], axis=1)
         self.decoder = BasicLayer(self.concat_yz,
             num_units_hidden = self.num_units_hidden_common,
             num_units_output = dim_image
@@ -129,7 +129,7 @@ class SemiVAE(layers.MergeLayer):
         )
 
     def convert_onehot(self, label_input):
-        return T.identity([self.num_classes, self.num_classes])[label_input].reshape([label_input.output_shape[0], -1])
+        return T.eye(self.num_classes)[label_input].reshape([label_input.shape[0], -1])
 
     def get_cost_L(self, inputs):
         # make it clear which get_output_for is used
@@ -137,11 +137,12 @@ class SemiVAE(layers.MergeLayer):
 
         # inputs must obey the order.
         image_input, label_input = inputs
-        label_input = self.convert_onehot(label_input)
-        mu_z = self.encoder_mu.get_output_for(self.concat_xy.get_output_for([image_input, label_input]))
+        label_input_oh = self.convert_onehot(label_input)
+        mu_z = self.encoder_mu.get_output_for(self.concat_xy.get_output_for([image_input, label_input_oh]))
         sigma_z = self.encoder_sigma.get_output_for(image_input)
         z = self.sampler.get_output_for([mu_z, sigma_z])
-        reconstruct = self.decoder.get_output_for(self.concat_yz.get_output_for([label_input, z]))
+        # use sigmoid function to constrain the value into [0, 1]
+        reconstruct = nonlinearities.sigmoid(self.decoder.get_output_for(self.concat_yz.get_output_for([label_input_oh, z])))
 
         l_x = objectives.binary_crossentropy(reconstruct, image_input).sum(1)
         l_z = ((mu_z ** 2 + sigma_z ** 2 - 1 - 2*T.log(sigma_z)) * 0.5).sum(1)
@@ -157,11 +158,12 @@ class SemiVAE(layers.MergeLayer):
         Similarly, word drop should be processed in theano or numpy?
         '''
 
-        label_input = self.srng.random_integers(image_input.shape[0])
-        label_input = self.convert_onehot(label_input)
-        prob_y_given_x = (T.nnet.softmax(self.classifier.get_output_for(image_input)) * label_input).sum(1)
+        label_input = self.srng.random_integers((image_input.shape[0],), 0, self.num_classes-1)
         cost_L = self.get_cost_L([image_input, label_input])
-        entropy_y_given_x = objectives.categorical_crossentropy(prob_y_given_x, prob_y_given_x)
+        label_input_oh = self.convert_onehot(label_input)
+        prob_ys_given_x = nonlinearities.softmax(self.classifier.get_output_for(image_input))
+        prob_y_given_x = prob_ys_given_x[T.arange(label_input.shape[0]), label_input]
+        entropy_y_given_x = objectives.categorical_crossentropy(prob_ys_given_x, prob_ys_given_x)
         cost_U = -(- prob_y_given_x * cost_L + entropy_y_given_x)
 
         return cost_U
@@ -188,7 +190,6 @@ class SemiVAE(layers.MergeLayer):
     def get_cost_test(self, inputs):
         image_input, label_input = inputs
         prob_ys_given_x = T.nnet.softmax(self.classifier.get_output_for(image_input))
-        label_input = self.convert_onehot(label_input)
         cost_test = objectives.categorical_crossentropy(prob_ys_given_x, label_input)
         cost_acc = T.eq(T.argmax(prob_ys_given_x, axis=1), label_input) # dtype?
 
@@ -198,7 +199,7 @@ class SemiVAE(layers.MergeLayer):
     def get_params(self):
         params = []
         params += self.encoder_mu.get_params()
-        params += self.decoder_sigma.get_params()
+        params += self.encoder_sigma.get_params()
         params += self.classifier.get_params()
         params += self.sampler.get_params()
 
