@@ -15,7 +15,7 @@ def init_configurations():
     params['num_classes'] = 10
     params['dim_z'] = 50
     params['num_units_hidden_common'] = 500
-    params['num_samples_train_label'] = 1000 # the first n samples in trainset.
+    params['num_samples_train_label'] = 4000 # the first n samples in trainset.
     params['epoch'] = 1000
     params['valid_period'] = 1 # temporary exclude validset
     params['test_period'] = 1
@@ -30,6 +30,13 @@ def load_data(params):
     params['num_samples_dev'] = dev[0].shape[0]
     params['num_samples_test'] = test[0].shape[0]
     params['alpha'] = 0.1
+
+    def convert_onehot(labels):
+        labels_oh = np.zeros([labels.shape[0], params['num_classes']])
+        for i in xrange(labels.shape[0]):
+            labels_oh[i, labels[i]] = 1
+        return labels_oh
+
 
     return train, dev, test
 
@@ -65,11 +72,13 @@ def build(params):
     update_for_unlabel = updates.adam(cost_for_unlabel, network_params)
 
     fn_for_label = theano.function([sym_images, sym_labels], cost_for_label,
-                                   updates = update_for_label,)
-                                   #on_unused_input = 'warn')
+                                   updates = update_for_label,
+                                   #on_unused_input = 'warn',
+                                   )
     fn_for_unlabel = theano.function([sym_images], cost_for_unlabel,
-                                     updates = update_for_unlabel,)
-                                     #on_unused_input = 'warn')
+                                     updates = update_for_unlabel,
+                                     #on_unused_input = 'warn'
+                                     )
 
     fn_for_test = theano.function([sym_images, sym_labels], [cost_test, acc_test])
 
@@ -107,6 +116,9 @@ def train():
 
         n_batches_train = n_batches_train_label + n_batches_train_unlabel
         idx_batches = np.random.permutation(n_batches_train) # idx < n_batches_train_label is for label
+
+        train_batch_costs_label = []
+        train_batch_costs_unlabel = []
         for batch in xrange(n_batches_train):
         #for batch in xrange(1):
             idx = idx_batches[batch]
@@ -117,13 +129,19 @@ def train():
                 #print('Training for label')
                 images, labels = iter_train_label.next()
                 train_batch_cost = fn_for_label(images, labels)
+                train_batch_costs_label.append(train_batch_cost)
                 #print('Epoch %d batch %d labelled: %f' % (epoch, batch, train_batch_cost))
             else:
             #if True:
                 #print('Training for unlabel')
                 images, = iter_train_unlabel.next()
                 train_batch_cost = fn_for_unlabel(images)
+		train_batch_costs_unlabel.append(train_batch_cost)
                 #print('Epoch %d batch %d unlabelled: %f' % (epoch, batch, train_batch_cost))
+
+        train_batch_mcost_label = np.mean(train_batch_costs_label)
+        train_batch_mcost_unlabel = np.mean(train_batch_costs_unlabel)
+        print('Epoch %d label %f unlabel %f' % (epoch, train_batch_mcost_label, train_batch_mcost_unlabel))
 
         if epoch % params['test_period'] == 0:
             n_batches_test = params['num_samples_test'] / params['batch_size']

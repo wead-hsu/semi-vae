@@ -3,34 +3,41 @@ Author Wead-Hsu, wead-hsu@github
 The implementation for paper tilted with 'semi-supervised
 learning with deep generative methods'.
 '''
+import numpy as np
 from theano import tensor as T
 from lasagne import layers
 from lasagne import nonlinearities
 from lasagne import objectives
 from theano.sandbox.rng_mrg import MRG_RandomStreams
-from theano.tensor.shared_randomstreams import RandomStreams
 
 
 __All__ = ['SemiVAE']
 
 class BasicLayer(layers.Layer):
-    def __init__(self, incoming, num_units_hidden, num_units_output):
+    def __init__(self, incoming, num_units_hidden, num_units_output,
+                 nonlinearity_hidden = T.nnet.softplus, 
+                 nonlinearity_output = T.nnet.softplus):
+
         super(BasicLayer, self).__init__(incoming)
 
         self.num_units_hidden = num_units_hidden
         self.num_units_output = num_units_output
 
         # the weight and the nonlinearity is set locally
-        self.input2hidden_layer = layers.DenseLayer(incoming, num_units_hidden,
-                                                    nonlinearity = T.nnet.softplus)
+        self.input_h1_layer = layers.DenseLayer(incoming, num_units_hidden,
+                                                nonlinearity = nonlinearity_hidden)
 
-        self.hidden2output_layer = layers.DenseLayer(self.input2hidden_layer, num_units_output,
-                                                     nonlinearity = T.nnet.softplus)
+        self.h1_h2_layer = layers.DenseLayer(self.input_h1_layer, num_units_hidden,
+                                             nonlinearity = nonlinearity_hidden)
+
+        self.h2_output_layer = layers.DenseLayer(self.h1_h2_layer, num_units_output,
+                                                 nonlinearity = nonlinearity_output)
 
 
     def get_output_for(self, input):
-        hidden_activation = self.input2hidden_layer.get_output_for(input)
-        output_activation = self.hidden2output_layer.get_output_for(hidden_activation)
+        h1_activation = self.input_h1_layer.get_output_for(input)
+        h2_activation = self.h1_h2_layer.get_output_for(h1_activation)
+        output_activation = self.h2_output_layer.get_output_for(h2_activation)
         return output_activation
 
 
@@ -40,8 +47,9 @@ class BasicLayer(layers.Layer):
 
     def get_params(self):
         params = []
-        params += self.input2hidden_layer.get_params()
-        params += self.hidden2output_layer.get_params()
+        params += self.input_h1_layer.get_params()
+        params += self.h1_h2_layer.get_params()
+        params += self.h2_output_layer.get_params()
         return params
 
 
@@ -56,12 +64,12 @@ class SamplerLayer(layers.MergeLayer):
 
     def get_output_for(self, inputs):
         assert isinstance(inputs, list)
-        eps = self.mrg_srng.normal((self.dim_sampling,))
-        return inputs[0] + inputs[1] * eps
+        self.eps = self.mrg_srng.normal((self.dim_sampling,))
+        return inputs[0] + T.exp(inputs[1]) * self.eps
 
 
-    def get_output_shape_for(self, input_shapes):
-        print('samplerlayer shape: ', input_shapes[0])
+    def get_output_shape_for(self, input_shapes): 
+        print('samplerlayer shape: ', input_shapes[0]) 
         assert input_shapes[0] == input_shapes[1]
         return input_shapes[0]
 
@@ -88,10 +96,9 @@ class SemiVAE(layers.MergeLayer):
         '''
 
         super(SemiVAE, self).__init__(incomings)
+        self.mrg_srng = MRG_RandomStreams()
 
         # random generator
-        self.srng = RandomStreams()
-
         self.incomings = incomings
         self.num_classes = incomings[1].output_shape[1]
         self.num_units_hidden_common = num_units_hidden_common
@@ -101,35 +108,38 @@ class SemiVAE(layers.MergeLayer):
         self.concat_xy  = layers.ConcatLayer(self.incomings, axis=1)
         self.encoder_mu = BasicLayer(self.concat_xy,
             num_units_hidden = self.num_units_hidden_common,
-            num_units_output = self.dim_z)
+            num_units_output = self.dim_z,
+            nonlinearity_output = nonlinearities.identity)
 
-        # softplus function gaurantee that output is nonnegative
-        self.encoder_sigma = BasicLayer(
+        self.encoder_log_sigma = BasicLayer(
             self.incomings[0],
             num_units_hidden = self.num_units_hidden_common,
-            num_units_output = self.dim_z)
+            num_units_output = self.dim_z,
+            nonlinearity_output = nonlinearities.identity)
 
         [image_input, label_input] = self.incomings
-        dim_image = image_input.output_shape[1]
-        print('dim_image: ', dim_image)
+        self.dim_image = image_input.output_shape[1]
+        print('dim_image: ', self.dim_image)
 
-        # merge encoder_mu and encoder_sigma to get z.
-        self.sampler = SamplerLayer((self.encoder_mu, self.encoder_sigma))
+        # merge encoder_mu and encoder_log_sigma to get z.
+        self.sampler = SamplerLayer((self.encoder_mu, self.encoder_log_sigma))
 
         self.concat_yz = layers.ConcatLayer([label_input, self.sampler], axis=1)
         self.decoder = BasicLayer(self.concat_yz,
             num_units_hidden = self.num_units_hidden_common,
-            num_units_output = dim_image
-        )
+            num_units_output = self.dim_image,
+            nonlinearity_output = nonlinearities.sigmoid)
 
         self.classifier = BasicLayer(
             self.incomings[0],
             num_units_hidden = self.num_units_hidden_common,
-            num_units_output = self.num_classes
-        )
+            num_units_output = self.num_classes,
+            nonlinearity_output = nonlinearities.softmax)
+
 
     def convert_onehot(self, label_input):
         return T.eye(self.num_classes)[label_input].reshape([label_input.shape[0], -1])
+
 
     def get_cost_L(self, inputs):
         # make it clear which get_output_for is used
@@ -139,15 +149,14 @@ class SemiVAE(layers.MergeLayer):
         image_input, label_input = inputs
         label_input_oh = self.convert_onehot(label_input)
         mu_z = self.encoder_mu.get_output_for(self.concat_xy.get_output_for([image_input, label_input_oh]))
-        sigma_z = self.encoder_sigma.get_output_for(image_input)
-        z = self.sampler.get_output_for([mu_z, sigma_z])
-        # use sigmoid function to constrain the value into [0, 1]
-        reconstruct = nonlinearities.sigmoid(self.decoder.get_output_for(self.concat_yz.get_output_for([label_input_oh, z])))
+        log_sigma_z = self.encoder_log_sigma.get_output_for(image_input)
+        z = self.sampler.get_output_for([mu_z, log_sigma_z])
+        reconstruct = (self.decoder.get_output_for(self.concat_yz.get_output_for([label_input_oh, z])))
 
         l_x = objectives.binary_crossentropy(reconstruct, image_input).sum(1)
-        l_z = ((mu_z ** 2 + sigma_z ** 2 - 1 - 2*T.log(sigma_z)) * 0.5).sum(1)
-
-        cost_L = l_z + l_x
+        l_z = ((mu_z ** 2 + T.exp(log_sigma_z*2) - 1 - 2*log_sigma_z) * 0.5).sum(1)
+        
+        cost_L = l_x + l_z
         return cost_L
 
 
@@ -157,21 +166,25 @@ class SemiVAE(layers.MergeLayer):
         Given unlabel data, whether label should be sampled in theano or numpy?
         Similarly, word drop should be processed in theano or numpy?
         '''
+        prob_ys_given_x = (self.classifier.get_output_for(image_input))
 
-        label_input = self.srng.random_integers((image_input.shape[0],), 0, self.num_classes-1)
-        cost_L = self.get_cost_L([image_input, label_input])
-        label_input_oh = self.convert_onehot(label_input)
-        prob_ys_given_x = nonlinearities.softmax(self.classifier.get_output_for(image_input))
-        prob_y_given_x = prob_ys_given_x[T.arange(label_input.shape[0]), label_input]
+        weighted_cost_L = T.zeros([image_input.shape[0],])
+	for i in xrange(self.num_classes):
+        	label_input = T.zeros([image_input.shape[0]], dtype='int64') + i
+        	cost_L = self.get_cost_L([image_input, label_input])
+        	prob_y_given_x = prob_ys_given_x[:, i]
+                weighted_cost_L += prob_y_given_x * cost_L
+
         entropy_y_given_x = objectives.categorical_crossentropy(prob_ys_given_x, prob_ys_given_x)
-        cost_U = -(- prob_y_given_x * cost_L + entropy_y_given_x)
+        cost_U = - entropy_y_given_x + weighted_cost_L
 
         return cost_U
 
 
     def get_cost_C(self, inputs):
+        print('getting_cost_C')
         image_input, label_input = inputs
-        prob_y_given_x = T.nnet.softmax(self.classifier.get_output_for(image_input))[T.arange(label_input.shape[0]), label_input]
+        prob_y_given_x = (self.classifier.get_output_for(image_input))[T.arange(label_input.shape[0]), label_input]
         cost_C = -T.log(prob_y_given_x)
         return cost_C
 
@@ -189,7 +202,7 @@ class SemiVAE(layers.MergeLayer):
 
     def get_cost_test(self, inputs):
         image_input, label_input = inputs
-        prob_ys_given_x = T.nnet.softmax(self.classifier.get_output_for(image_input))
+        prob_ys_given_x = (self.classifier.get_output_for(image_input))
         cost_test = objectives.categorical_crossentropy(prob_ys_given_x, label_input)
         cost_acc = T.eq(T.argmax(prob_ys_given_x, axis=1), label_input) # dtype?
 
@@ -199,7 +212,8 @@ class SemiVAE(layers.MergeLayer):
     def get_params(self):
         params = []
         params += self.encoder_mu.get_params()
-        params += self.encoder_sigma.get_params()
+        params += self.encoder_log_sigma.get_params()
+        params += self.decoder.get_params()
         params += self.classifier.get_params()
         params += self.sampler.get_params()
 
