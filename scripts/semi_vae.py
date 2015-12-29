@@ -86,7 +86,7 @@ class SemiVAE(layers.MergeLayer):
                  incomings,
                  num_units_hidden_common,
                  dim_z,
-                 alpha
+                 beta
                  ):
         '''
          params:
@@ -103,7 +103,7 @@ class SemiVAE(layers.MergeLayer):
         self.num_classes = incomings[1].output_shape[1]
         self.num_units_hidden_common = num_units_hidden_common
         self.dim_z = dim_z
-        self.alpha = alpha
+        self.beta = beta
 
         self.concat_xy  = layers.ConcatLayer(self.incomings, axis=1)
         self.encoder_mu = BasicLayer(self.concat_xy,
@@ -136,9 +136,9 @@ class SemiVAE(layers.MergeLayer):
             num_units_output = self.num_classes,
             nonlinearity_output = nonlinearities.softmax)
 
-
-    def convert_onehot(self, label_input):
-        return T.eye(self.num_classes)[label_input].reshape([label_input.shape[0], -1])
+    
+    def convert_onehot(self, label_input_cat):
+        return T.eye(self.num_classes)[label_input_cat].reshape([label_input_cat.shape[0], -1])
 
 
     def get_cost_L(self, inputs):
@@ -147,11 +147,10 @@ class SemiVAE(layers.MergeLayer):
 
         # inputs must obey the order.
         image_input, label_input = inputs
-        label_input_oh = self.convert_onehot(label_input)
-        mu_z = self.encoder_mu.get_output_for(self.concat_xy.get_output_for([image_input, label_input_oh]))
+        mu_z = self.encoder_mu.get_output_for(self.concat_xy.get_output_for([image_input, label_input]))
         log_sigma_z = self.encoder_log_sigma.get_output_for(image_input)
         z = self.sampler.get_output_for([mu_z, log_sigma_z])
-        reconstruct = (self.decoder.get_output_for(self.concat_yz.get_output_for([label_input_oh, z])))
+        reconstruct = (self.decoder.get_output_for(self.concat_yz.get_output_for([label_input, z])))
 
         l_x = objectives.binary_crossentropy(reconstruct, image_input).sum(1)
         l_z = ((mu_z ** 2 + T.exp(log_sigma_z*2) - 1 - 2*log_sigma_z) * 0.5).sum(1)
@@ -162,21 +161,30 @@ class SemiVAE(layers.MergeLayer):
 
     def get_cost_U(self, image_input):
         print('getting_cost_U')
-        '''
-        Given unlabel data, whether label should be sampled in theano or numpy?
-        Similarly, word drop should be processed in theano or numpy?
-        '''
         prob_ys_given_x = (self.classifier.get_output_for(image_input))
+        
+        '''
+        label_input_with = []
+	for i in xrange(self.num_classes):
+                label_input_with.append(T.zeros([image_input.shape[0]], dtype='int64') + i)
+
+        cost_L_with = []
+	for i in xrange(self.num_classes):
+                cost_L_with.append(self.get_cost_L([image_input, label_input_with[i]]))
 
         weighted_cost_L = T.zeros([image_input.shape[0],])
-	for i in xrange(self.num_classes):
-        	label_input = T.zeros([image_input.shape[0]], dtype='int64') + i
-        	cost_L = self.get_cost_L([image_input, label_input])
-        	prob_y_given_x = prob_ys_given_x[:, i]
-                weighted_cost_L += prob_y_given_x * cost_L
+        for i in xrange(self.num_classes):
+                weighted_cost_L += prob_ys_given_x[:, i] * cost_L_with[i]
+        '''
+        weighted_cost_L = T.zeros([image_input.shape[0],])
+        for i in xrange(self.num_classes):
+            label_input = T.zeros([image_input.shape[0], self.num_classes])
+            label_input = T.set_subtensor(label_input[:, i], 1)
+            cost_L = self.get_cost_L([image_input, label_input])
+            weighted_cost_L += prob_ys_given_x[:,i] * cost_L
 
         entropy_y_given_x = objectives.categorical_crossentropy(prob_ys_given_x, prob_ys_given_x)
-        cost_U = - entropy_y_given_x + weighted_cost_L
+        cost_U = weighted_cost_L - entropy_y_given_x 
 
         return cost_U
 
@@ -184,7 +192,7 @@ class SemiVAE(layers.MergeLayer):
     def get_cost_C(self, inputs):
         print('getting_cost_C')
         image_input, label_input = inputs
-        prob_y_given_x = (self.classifier.get_output_for(image_input))[T.arange(label_input.shape[0]), label_input]
+        prob_y_given_x = (self.classifier.get_output_for(image_input)* label_input).sum(1)
         cost_C = -T.log(prob_y_given_x)
         return cost_C
 
@@ -192,7 +200,7 @@ class SemiVAE(layers.MergeLayer):
     def get_cost_for_label(self, inputs):
         cost_L = self.get_cost_L(inputs)
         cost_C = self.get_cost_C(inputs)
-        return cost_L.mean() + self.alpha * cost_C.mean()
+        return cost_L.mean() + self.beta * cost_C.mean()
 
 
     def get_cost_for_unlabel(self, input):
@@ -200,11 +208,19 @@ class SemiVAE(layers.MergeLayer):
         return cost_U.mean()
 
 
+    def get_cost_together(self, inputs):
+        label_images, label_labels, unlabel_images = inputs
+        cost_for_label = self.get_cost_for_label([label_images, label_labels]) * label_images.shape[0]
+        cost_for_unlabel = self.get_cost_for_unlabel(unlabel_images) * unlabel_images.shape[0]
+        cost_together = (cost_for_label + cost_for_unlabel) / (label_images.shape[0] + unlabel_images.shape[0])
+        return cost_together
+
+
     def get_cost_test(self, inputs):
         image_input, label_input = inputs
         prob_ys_given_x = (self.classifier.get_output_for(image_input))
         cost_test = objectives.categorical_crossentropy(prob_ys_given_x, label_input)
-        cost_acc = T.eq(T.argmax(prob_ys_given_x, axis=1), label_input) # dtype?
+        cost_acc = T.eq(T.argmax(prob_ys_given_x, axis=1), T.argmax(label_input, axis=1))
 
         return cost_test.mean(), cost_acc.mean()
 
