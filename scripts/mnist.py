@@ -12,14 +12,15 @@ from misc import *
 def init_configurations():
     params = {}
     params['data_path'] = '../data/mnist.pkl.gz'
-    params['batch_size'] = 1000
+    params['batch_size'] = 250
     params['num_classes'] = 10
     params['dim_z'] = 50
     params['num_units_hidden_common'] = 500
-    params['num_samples_train_label'] = 4000 # the first n samples in trainset.
-    params['epoch'] = 1000
+    params['num_samples_train_label'] = 1000 # the first n samples in trainset.
+    params['epoch'] = 3000
     params['valid_period'] = 1 # temporary exclude validset
     params['test_period'] = 1
+    params['alpha'] = 0.1
     return params
 
 
@@ -30,7 +31,6 @@ def load_data(params, binarize_y = False):
     params['num_samples_train'] = train[0].shape[0]
     params['num_samples_dev'] = dev[0].shape[0]
     params['num_samples_test'] = test[0].shape[0]
-    params['alpha'] = 0.1
 
     if binarize_y:
         train = [train[0], binarize_labels(train[1], params['num_classes'])]
@@ -40,7 +40,24 @@ def load_data(params, binarize_y = False):
     return train, dev, test
 
 
-def split_with_label(params, dataset, binarize_y = False):
+def load_data_split(params, binarize_y = False):
+    train, dev, test = load_data(params, binarize_y = False)
+    train_label, train_unlabel = split_with_label(params, train)
+
+    if binarize_y:
+        train_label = [train_label[0], binarize_labels(train_label[1], params['num_classes'])]
+        train_unlabel = [train_unlabel[0], binarize_labels(train_unlabel[1], params['num_classes'])]
+        dev = [dev[0], binarize_labels(dev[1], params['num_classes'])]
+        test = [test[0], binarize_labels(test[1], params['num_classes'])]
+
+    return train_label, train_unlabel, dev, test
+
+
+def split_with_label(params, dataset):
+    '''
+    precondition:
+        label in dataset should be unbinarized.
+    '''
     images, labels = dataset
 
     label_images_with_label = []
@@ -53,16 +70,12 @@ def split_with_label(params, dataset, binarize_y = False):
         label_labels_with_label.append(labels[labels == i][:num_label_per_label])
         unlabel_images_with_label.append(images[labels == i][num_label_per_label:])
         unlabel_labels_with_label.append(labels[labels == i][num_label_per_label:])
-    
+
     label_images = np.vstack(label_images_with_label)
     label_labels = np.concatenate(label_labels_with_label, axis = 0)
 
     unlabel_images = np.vstack(unlabel_images_with_label)
     unlabel_labels = np.concatenate(unlabel_labels_with_label, axis = 0)
-
-    if binarize_y:
-        label_labels = binarize_labels(label_labels, params['num_classes'])
-        unlabel_labels = binarize_labels(unlabel_labels, params['num_classes'])
 
     return [label_images, label_labels], [unlabel_images, unlabel_labels]
 
@@ -97,7 +110,7 @@ def build(params):
 
     update_for_label = updates.adam(cost_for_label, network_params)
     update_for_unlabel = updates.adam(cost_for_unlabel, network_params)
-    update_together = updates.adam(cost_together, network_params)
+    update_together = updates.adam(cost_together, network_params, learning_rate=3e-4)
 
     fn_train = theano.function([sym_label_images, sym_label_labels, sym_unlabel_images],
                                 cost_together,
@@ -125,10 +138,7 @@ def build(params):
 
 def train():
     params = init_configurations()
-    trainset, devset, testset = load_data(params)
-    devset = [devset[0], binarize_labels(devset[1], params['num_classes'])]
-    testset = [testset[0], binarize_labels(testset[1], params['num_classes'])]
-    trainset_label, trainset_unlabel = split_with_label(params, trainset, binarize_y = True)
+    trainset_label, trainset_unlabel, devset, testset = load_data_split(params, binarize_y = True)
 
     assert params['num_samples_train'] % params['batch_size'] == 0
     assert params['num_samples_dev'] % params['batch_size'] == 0
@@ -142,7 +152,7 @@ def train():
 
     num_samples_per_batch_label = params['num_samples_train_label'] / num_batches_train
     num_samples_per_batch_unlabel = params['batch_size'] - num_samples_per_batch_label
-    
+
     print(num_samples_per_batch_label)
     print(num_samples_per_batch_unlabel)
     print(params)
@@ -150,7 +160,7 @@ def train():
     iter_train_label = BatchIterator(range(params['num_samples_train_label']),
                                      num_samples_per_batch_label,
                                      data = trainset_label)
-    
+
     num_samples_train_unlabel = params['num_samples_train'] - params['num_samples_train_label']
     iter_train_unlabel = BatchIterator(range(num_samples_train_unlabel),
                                         num_samples_per_batch_unlabel,
@@ -161,6 +171,7 @@ def train():
                               data = testset,
                               testing = True)
 
+    # remain fn_for_label and fn_for_unlabel for testing
     semi_vea_layer, fn_for_label, fn_for_unlabel, fn_train, fn_for_test = build(params)
 
     for epoch in xrange(params['epoch']):
@@ -169,6 +180,7 @@ def train():
 
         #train_batch_costs_label = []
         #train_batch_costs_unlabel = []
+        train_batch_costs = []
         for batch in xrange(num_batches_train):
         #for batch in xrange(1):
             #idx = idx_batches[batch]
@@ -178,8 +190,10 @@ def train():
             label_images, label_labels = iter_train_label.next()
             unlabel_images, _ = iter_train_unlabel.next()
             #print label_images, label_labels, unlabel_images
-            train_batch_costs = fn_train(label_images, label_labels, unlabel_images)
-            print(train_batch_costs)
+            train_batch_cost = fn_train(label_images, label_labels, unlabel_images)
+            train_batch_costs.append(train_batch_cost)
+
+        print('TRAIN epoch %d: %f'%(epoch, np.mean(train_batch_costs)))
 
         #print('Epoch %d label %f unlabel %f' % (epoch, train_batch_mcost_label, train_batch_mcost_unlabel))
 
